@@ -4,6 +4,9 @@ import argparse
 import glob
 import multiprocessing as mp
 from functools import partial
+import shutil
+
+S3_BUCKET = "PLACEHOLDER"
 
 
 def resize_video(input_path, output_path):
@@ -90,7 +93,7 @@ def process_videos_in_folder(video_folder, processed_folder, num_processes=None)
     
     # Determine number of processes
     if num_processes is None:
-        num_processes = min(mp.cpu_count(), len(video_files), 4)  # Cap at 4 to avoid overwhelming system
+        num_processes = min(mp.cpu_count(), len(video_files), 64)  # Cap at 64 to avoid overwhelming system
     
     print(f"Using {num_processes} processes for video processing...")
     
@@ -114,17 +117,75 @@ def process_videos_in_folder(video_folder, processed_folder, num_processes=None)
     print(f"Video processing complete: {successful} successful, {failed} failed")
 
 
+def zip_and_upload_to_s3(processed_folder, part_number):
+    """
+    Zip the processed folder and upload to S3
+    Returns True if successful, False otherwise
+    """
+    if not os.path.exists(processed_folder) or not os.listdir(processed_folder):
+        print(f"Processed folder {processed_folder} is empty or doesn't exist, skipping zip/upload")
+        return False
+    
+    # Create zip file name
+    zip_filename = f"video_480p_part_{part_number}.zip"
+    zip_path = os.path.join(os.path.dirname(processed_folder), zip_filename)
+    
+    try:
+        # Create zip file
+        print(f"Creating zip file: {zip_filename}")
+        shutil.make_archive(zip_path[:-4], 'zip', processed_folder)  # Remove .zip extension as make_archive adds it
+        
+        if not os.path.exists(zip_path):
+            print(f"Error: Zip file {zip_path} was not created")
+            return False
+        
+        # Upload to S3
+        s3_path = f"s3://{S3_BUCKET}/kelkar/dataset/{zip_filename}"
+        upload_command = ["aws", "s3", "cp", zip_path, s3_path]
+        
+        print(f"Uploading {zip_filename} to S3...")
+        result = subprocess.run(upload_command, check=True, capture_output=True, text=True)
+        print(f"Successfully uploaded {zip_filename} to {s3_path}")
+        
+        # Clean up: remove the zip file and processed folder to save space
+        try:
+            os.remove(zip_path)
+            print(f"Deleted local zip file: {zip_path}")
+            
+            shutil.rmtree(processed_folder)
+            print(f"Deleted processed folder: {processed_folder}")
+        except OSError as e:
+            print(f"Warning: Could not clean up files: {e}")
+        
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error uploading {zip_filename} to S3:")
+        print(f"Command: {' '.join(upload_command)}")
+        print(f"Return code: {e.returncode}")
+        if e.stdout:
+            print(f"STDOUT: {e.stdout}")
+        if e.stderr:
+            print(f"STDERR: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"Error creating zip or uploading {zip_filename}: {e}")
+        return False
+
+
 def download_files(output_directory, num_processes=None):
     zip_folder = os.path.join(output_directory, "download")
     video_folder = os.path.join(output_directory, "video")
-    processed_folder = os.path.join(output_directory, "video_480p")
     os.makedirs(zip_folder, exist_ok=True)
     os.makedirs(video_folder, exist_ok=True)
-    os.makedirs(processed_folder, exist_ok=True)
 
     error_log_path = os.path.join(zip_folder, "download_log.txt")
 
-    for i in range(1, 100): # 186
+    for i in range(1, 100):
+        # Create separate folder for each part's processed videos
+        processed_folder = os.path.join(output_directory, f"video_480p_part_{i}")
+        os.makedirs(processed_folder, exist_ok=True)
+        
         url = f"https://huggingface.co/datasets/nkp37/OpenVid-1M/resolve/main/OpenVidHD/OpenVidHD_part_{i}.zip"
         file_path = os.path.join(zip_folder, f"OpenVidHD_part_{i}.zip")
         if os.path.exists(file_path):
@@ -134,13 +195,25 @@ def download_files(output_directory, num_processes=None):
         command = ["wget", "-O", file_path, url]
         unzip_command = ["unzip", "-j", file_path, "-d", video_folder]
         try:
-            # subprocess.run(command, check=True)
+            subprocess.run(command, check=True)
             print(f"file {url} saved to {file_path}")
-            # subprocess.run(unzip_command, check=True)
+            subprocess.run(unzip_command, check=True)
             
             # Process videos after each successful extraction
             print(f"Processing videos from part {i}...")
             process_videos_in_folder(video_folder, processed_folder, num_processes)
+            
+            # Zip processed folder and upload to S3
+            print(f"Zipping and uploading part {i} to S3...")
+            success = zip_and_upload_to_s3(processed_folder, i)
+
+            if success:
+                print(f"Cleaning up original downloaded files for part {i}...")
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted original downloaded zip: {file_path}")
+                except OSError as e:
+                    print(f"Warning: Could not delete original zip {file_path}: {e}")
             
         except subprocess.CalledProcessError as e:
             error_message = f"file {url} download failed: {e}\n"
@@ -177,6 +250,27 @@ def download_files(output_directory, num_processes=None):
                 # Process videos after successful extraction from concatenated parts
                 print(f"Processing videos from part {i} (concatenated)...")
                 process_videos_in_folder(video_folder, processed_folder, num_processes)
+                
+                # Zip processed folder and upload to S3
+                print(f"Zipping and uploading part {i} (concatenated) to S3...")
+                success = zip_and_upload_to_s3(processed_folder, i)
+
+                if success:
+                    print(f"Cleaning up original downloaded files for part {i}...")
+                    try:
+                        # Delete concatenated file
+                        os.remove(file_path)
+                        print(f"Deleted concatenated zip: {file_path}")
+
+                        # Delete parts
+                        part_files_pattern = os.path.join(zip_folder, f"OpenVidHD_part_{i}_part_*")
+                        part_files = glob.glob(part_files_pattern)
+                        for part_file in part_files:
+                            os.remove(part_file)
+                            print(f"Deleted part file: {part_file}")
+
+                    except OSError as e:
+                        print(f"Warning: Could not delete original downloaded files for part {i}: {e}")
             except subprocess.CalledProcessError as unzip_e:
                 print(f"Failed to unzip concatenated file for part {i}: {unzip_e}")
     
